@@ -319,8 +319,54 @@ def load_model(
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
-    for wf in weight_files:
-        weights.update(mx.load(wf))
+    # Streaming MoE: optionally skip expert weights during loading.
+    # When stream_experts=True, expert weights (switch_mlp.*.weight/scales/biases)
+    # are NOT loaded into memory. Instead, their file locations are recorded
+    # for on-demand streaming during forward passes via mmap.
+    stream_experts = config.get("stream_experts", False)
+    _expert_weight_locations = {}  # {tensor_name: file_path} for streaming
+
+    if stream_experts:
+        # Streaming MoE: load ALL tensors lazily via mx.load (mmap-backed).
+        # Expert tensors stay as lazy mmap references — only the pages
+        # accessed during forward passes are read from disk.
+        # Non-expert tensors are loaded normally (they're small, ~5GB).
+        import json as _json
+        import struct as _struct
+
+        for wf in weight_files:
+            with open(wf, "rb") as f:
+                hdr_len = _struct.unpack("<Q", f.read(8))[0]
+                header = _json.loads(f.read(hdr_len))
+
+            # Separate expert vs non-expert tensors
+            expert_names = set()
+            non_expert_names = []
+            for name in header:
+                if name == "__metadata__":
+                    continue
+                if "switch_mlp" in name or "mlp.experts." in name:
+                    expert_names.add(name)
+                    _expert_weight_locations[name] = wf
+                else:
+                    non_expert_names.append(name)
+
+            # Load only non-expert tensors from this shard
+            if non_expert_names:
+                all_in_file = mx.load(wf)
+                for name in non_expert_names:
+                    if name in all_in_file:
+                        weights[name] = all_in_file[name]
+                del all_in_file
+
+            if expert_names:
+                print(
+                    f"[streaming] Skipped {len(expert_names)} expert tensors "
+                    f"from {Path(wf).name}"
+                )
+    else:
+        for wf in weight_files:
+            weights.update(mx.load(wf))
 
     if (model_file := config.get("model_file")) is not None:
         spec = importlib.util.spec_from_file_location(
@@ -352,6 +398,10 @@ def load_model(
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
+            # When streaming experts, force-quantize expert layers even though
+            # their weights aren't in the dict (they'll be mmap'd later)
+            if stream_experts and ("switch_mlp" in p or "mlp.experts." in p):
+                return True
             return f"{p}.scales" in weights
 
         nn.quantize(
@@ -412,7 +462,16 @@ def load_model(
         model.update_modules(leaves)
 
     model.eval()
-    model.load_weights(list(weights.items()), strict=strict)
+    model.load_weights(
+        list(weights.items()), strict=strict if not stream_experts else False
+    )
+
+    if stream_experts and _expert_weight_locations:
+        # Wire up streaming expert dispatch: replace QuantizedSwitchLinear
+        # with StreamingSwitchLinear that loads experts from disk on-demand.
+        from .models.streaming_switch import setup_streaming_experts
+
+        setup_streaming_experts(model, _expert_weight_locations, model_path, config)
 
     if not lazy:
         mx.eval(model.parameters())
