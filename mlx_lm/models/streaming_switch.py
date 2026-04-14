@@ -8,6 +8,18 @@ manages which expert pages stay in DRAM vs. are paged from SSD.
 This enables running MoE models whose expert weights exceed available unified
 memory — for example Qwen3.5-397B-A17B (209 GB at 4-bit) on a 64 GB machine.
 
+Each expert tensor is held as a ``numpy.memmap`` reference. On each call
+only the K selected expert slices are copied into ``mx.array`` objects for
+``mx.gather_qmm``; hot slices stay in the OS page cache while cold ones
+fault from SSD.
+
+(An earlier experiment using ``mx.load``-backed arrays with ``mx.take``
+was 27% faster per call in microbenchmarks, but caused GPU OOM because
+mlx materialises the full source tensor into unified memory on first
+access — untenable when the aggregate expert tensor footprint exceeds
+available memory. The numpy path is kept because its per-slice copy does
+not pin the rest of the source.)
+
 Usage::
 
     # Add to model's config.json:
@@ -148,23 +160,24 @@ class StreamingSwitchLinear(nn.Module):
         self._np_biases = biases
 
     def load_subset(self, unique_indices: List[int]):
-        """Read the requested expert slices and return ``mx.array`` triples."""
+        """Read the requested expert slices and return ``mx.array`` triples.
+
+        Scales/biases for affine quantisation are stored as bf16 on disk;
+        numpy memmap surfaces them as uint16 (same bytes). We reinterpret
+        via ``.view(mx.bfloat16)`` (no copy) and pass directly to
+        ``gather_qmm``, which accepts bf16 scales natively. For mxfp4
+        quantisation, scales are uint8 and pass through unchanged.
+        """
         w = mx.array(self._np_weight[unique_indices])
-        s_raw = mx.array(self._np_scales[unique_indices])
-        # For affine mode: scales stored as bf16 (uint16) on disk, need float32.
-        # For mxfp4 mode: scales stored as uint8, keep as-is.
+        s = mx.array(self._np_scales[unique_indices])
         if self._np_scales.dtype == np.uint16:
-            s = s_raw.view(mx.bfloat16).astype(mx.float32)
-        else:
-            s = s_raw
+            s = s.view(mx.bfloat16)
 
         b = None
         if self._np_biases is not None:
-            b_raw = mx.array(self._np_biases[unique_indices])
+            b = mx.array(self._np_biases[unique_indices])
             if self._np_biases.dtype == np.uint16:
-                b = b_raw.view(mx.bfloat16).astype(mx.float32)
-            else:
-                b = b_raw
+                b = b.view(mx.bfloat16)
         return w, s, b
 
     # -- forward -------------------------------------------------------------
