@@ -39,6 +39,7 @@ from .models.cache import (
     load_prompt_cache,
 )
 from .sample_utils import make_sampler
+from .spec_prefill import SpecPrefillConfig, apply_spec_prefill
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -319,6 +320,16 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    speculator: Optional[nn.Module] = None,
+    speculator_threshold: int = 8192,
+    keep_fraction: float = 0.2,
+    block_size: int = 32,
+    pool_kernel: int = 13,
+    lookahead_steps: int = 8,
+    position_layout: str = "compact_with_tail",
+    tail_size: int = 256,
+    sink_size: int = 16,
+    aggregation: str = "pool_then_max",
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -421,53 +432,86 @@ def generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream):
-        total_prompt_tokens = (
-            len(input_embeddings) if input_embeddings is not None else len(prompt)
+    spec_prefill_cleanup: Optional[Callable[[], None]] = None
+    if (
+        speculator is not None
+        and input_embeddings is None
+        and prompt.size > speculator_threshold
+    ):
+        spec_cfg = SpecPrefillConfig(
+            speculator_threshold=speculator_threshold,
+            keep_fraction=keep_fraction,
+            block_size=block_size,
+            pool_kernel=pool_kernel,
+            lookahead_steps=lookahead_steps,
+            position_layout=position_layout,
+            tail_size=tail_size,
+            prefill_step_size=prefill_step_size,
+            sink_size=sink_size,
+            aggregation=aggregation,
         )
-        prompt_processed_tokens = 0
-        prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
-        while total_prompt_tokens - prompt_processed_tokens > 1:
-            remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
-            n_to_process = min(prefill_step_size, remaining)
-            _model_call(
-                input_tokens=prompt[:n_to_process][None],
-                input_embeddings=(
-                    input_embeddings[:n_to_process][None]
+        with mx.stream(generation_stream):
+            seed, spec_prefill_cleanup = apply_spec_prefill(
+                model, speculator, prompt, prompt_cache, spec_cfg
+            )
+        prompt = seed
+        # Bias the progress callback to reflect that we no longer need to
+        # process the full prompt (this is the whole point of SpecPrefill).
+        # We treat the spec-prefill as a single jump.
+        prompt_progress_callback(prompt.size, prompt.size)
+
+    try:
+        with mx.stream(generation_stream):
+            total_prompt_tokens = (
+                len(input_embeddings) if input_embeddings is not None else len(prompt)
+            )
+            prompt_processed_tokens = 0
+            if spec_prefill_cleanup is None:
+                prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+            while total_prompt_tokens - prompt_processed_tokens > 1:
+                remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
+                n_to_process = min(prefill_step_size, remaining)
+                _model_call(
+                    input_tokens=prompt[:n_to_process][None],
+                    input_embeddings=(
+                        input_embeddings[:n_to_process][None]
+                        if input_embeddings is not None
+                        else None
+                    ),
+                )
+                quantize_cache_fn(prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                prompt_processed_tokens += n_to_process
+                prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+                prompt = prompt[n_to_process:]
+                input_embeddings = (
+                    input_embeddings[n_to_process:]
                     if input_embeddings is not None
-                    else None
-                ),
-            )
-            quantize_cache_fn(prompt_cache)
-            mx.eval([c.state for c in prompt_cache])
-            prompt_processed_tokens += n_to_process
-            prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
-            prompt = prompt[n_to_process:]
-            input_embeddings = (
-                input_embeddings[n_to_process:]
-                if input_embeddings is not None
-                else input_embeddings
-            )
-            mx.clear_cache()
+                    else input_embeddings
+                )
+                mx.clear_cache()
 
-        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+            y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
-    mx.async_eval(y, logprobs)
-    n = 0
-    while True:
-        if n != max_tokens:
-            next_y, next_logprobs = _step(y)
-            mx.async_eval(next_y, next_logprobs)
-        if n == 0:
-            mx.eval(y)
-            prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
-        if n == max_tokens:
-            break
-        yield y.item(), logprobs
-        if n % 256 == 0:
-            mx.clear_cache()
-        y, logprobs = next_y, next_logprobs
-        n += 1
+        mx.async_eval(y, logprobs)
+        n = 0
+        while True:
+            if n != max_tokens:
+                next_y, next_logprobs = _step(y)
+                mx.async_eval(next_y, next_logprobs)
+            if n == 0:
+                mx.eval(y)
+                prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+            if n == max_tokens:
+                break
+            yield y.item(), logprobs
+            if n % 256 == 0:
+                mx.clear_cache()
+            y, logprobs = next_y, next_logprobs
+            n += 1
+    finally:
+        if spec_prefill_cleanup is not None:
+            spec_prefill_cleanup()
 
 
 def speculative_generate_step(
