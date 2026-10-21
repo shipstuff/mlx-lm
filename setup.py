@@ -24,6 +24,7 @@ setup(
     url="https://github.com/ml-explore/mlx-lm",
     license="MIT",
     install_requires=[
+        "certifi>=2026.10.19",
         f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
         "numpy",
         "transformers>=5.0.0",
